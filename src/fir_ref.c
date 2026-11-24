@@ -10,7 +10,7 @@ void fir_ref_f64(const double *x, const double *h, int ntaps, int nout,
         double acc = 0.0;
 
         for (k = 0; k < ntaps; k++)
-            acc += h[k] * xp[-k];
+            acc += (h ? h[k] : xp[-k]) * xp[-k];
 
         y[n] = acc;
     }
@@ -26,7 +26,7 @@ void fir_ref_f80(const double *x, const double *h, int ntaps, int nout,
         long double acc = 0.0L;
 
         for (k = 0; k < ntaps; k++)
-            acc += (long double)h[k] * (long double)xp[-k];
+            acc += (long double)(h ? h[k] : xp[-k]) * (long double)xp[-k];
 
         y[n] = acc;
     }

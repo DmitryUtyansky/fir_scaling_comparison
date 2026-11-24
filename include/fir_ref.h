@@ -10,6 +10,7 @@
  * x holds nout + ntaps - 1 samples, y holds nout samples.  Both x and h are
  * plain values; the harness feeds them as raw integer LSB counts so that the
  * result can be compared directly against the fixed-point output register.
+ * h == NULL squares the input instead, as the kernels do.
  */
 void fir_ref_f64(const double *x, const double *h, int ntaps, int nout,
                  double *y);

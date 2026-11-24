@@ -15,6 +15,9 @@ typedef struct {
 /* ref and out are both in the output register domain (LSB counts). */
 fir_metrics_t fir_metrics(const double *ref, const double *out, int n);
 
+/* As fir_metrics, with the error out - ref supplied by the caller. */
+fir_metrics_t fir_metrics_err(const double *ref, const double *err, int n);
+
 /* Numerical noise floor of the double reference, in dB below the signal. */
 double fir_ref_floor_db(const double *ref, const long double *ref_hi, int n);
 

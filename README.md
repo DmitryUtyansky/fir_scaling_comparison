@@ -27,9 +27,10 @@ with `ntaps` = 256 and 1024 output samples by default. The input buffer holds
 start-up transient in the measurement.
 
 Samples and coefficients are Qm numbers (m = 15 in a 16-bit container, or
-m = 31 in a 32-bit container). The output has the same width as the input:
-the accumulator is always scaled back to a single-width Qm result with
-rounding and saturation.
+m = 31 in a 32-bit container). By default the output has the same width as
+the input: the accumulator is scaled back to a single-width Qm result with
+rounding and saturation. `--out_width 2x` writes a double-width output
+instead (see [2x output](#2x-output---out_width-2x)).
 
 ### Scaling model
 
@@ -51,14 +52,14 @@ total = m + G
 before it is written back as a Qm sample. Every variant applies exactly this
 total shift, only split up differently between a shift in front of the
 accumulator (`pre` in the report) and one after it (`post`), which always add
-up to `total`. All nine results therefore live on the same scale and are
+up to `total`. All ten results therefore live on the same scale and are
 directly comparable.
 
 The default `s` is `G`, the smallest shift that guarantees a 2x-wide
 accumulator cannot overflow for full-scale input ("matched downscaling
 shifts"). Both `s` and `G` can be forced from the command line.
 
-### The nine variants
+### The ten variants
 
 The listings below use these types and primitives, all of which exist in
 `include/fir_kernels.inc` under longer names:
@@ -160,8 +161,22 @@ for (k = 0; k < N; k++)
 y[n] = sat(shift_rnd(acc, s));
 ```
 
+**V10** — V5 with the product shift fixed at `W - 1 = m` (15 for Q15, 31 for
+Q31), whatever the number of taps or `s`. Every product enters the 2x
+accumulator as a Qm value, and the remaining `total - m = G` is applied after
+the loop. The 2x accumulator has m + 1 bits to spare above a Qm value, so
+it cannot overflow for up to `2^(m+1)` taps (65536 for Q15). It is reported in the main
+table only, since the sweep varies `s`; the self test checks that it equals
+V5 at `s = m`.
+
+```c
+for (k = 0; k < N; k++)
+    acc2 = wrap2(acc2 + shift_rnd((T2)xk * h[k], m));
+y[n] = sat(wrap2(acc2 + half(total - m)) >> (total - m));
+```
+
 V7, V8 and V9 run the same kernel and differ only in where the total shift is
-split around the accumulator. In V3 to V6 the rounding constant of the final
+split around the accumulator; V10 is the V5 kernel. In V3 to V6 the rounding constant of the final
 shift is written out because it has to travel through the same wrapping or
 saturating adder as the rest of the sum; everywhere else `shift_rnd()` is
 evaluated in a type that cannot overflow, so the plain form is exact.
@@ -195,6 +210,129 @@ noise variance; in addition
   are rounded straight onto the output grid, so this term is `ntaps/12` at
   the output and there is no separate output rounding.
 
+### 2x output (`--out_width 2x`)
+
+The output is written to a 2W container with `2m + 1` fractional bits, i.e.
+Q31 for Q15 input and Q63 for Q31 input, on the same `y_exact / 2^G` scale.
+Since the accumulator carries Q2m, the total shift becomes
+
+```
+total = 2m + G - (2m + 1) = G - 1
+```
+
+which is -1 when there are no guard bits. Post shifts can therefore be
+negative; they are exact left shifts into the wide output, so no rounding
+happens there. With the default `s = G`, V2 to V6 have `post = -1`.
+
+The single-wide accumulator of V7, V8 and V9 still has to hold a Qm-scaled
+sum, so these variants keep their 1x pre shifts (V7: `m + G`, V8: `s`,
+V9: `m + G - s`) and left-shift the remainder into the output. They produce
+the 1x result padded with zeros, and their SNR is unchanged; the wider output
+only helps the variants with a wide accumulator.
+
+A double cannot resolve a Q63 LSB, so in 2x mode the errors are computed
+exactly against a 128-bit integer reference instead of the double one. The
+model for the product-scaling term also includes the bias of round-half-up.
+For products of two integers, the low `s` bits are not uniform: ties occur
+with probability `P(v2(x) + v2(h) = s - 1)`, for example 1/8 at `s = 4`. That
+bias adds up coherently over the taps (`ntaps^2 * mean^2`). In 1x mode it lies
+far below the output rounding and the plain `ntaps/12` term is kept. In 2x
+mode, with no output rounding left, it can dominate V5/V6 by 10 dB. Output in
+1x mode is identical to earlier versions.
+
+### Squaring (`--squaring`)
+
+Every tap uses the data sample it multiplies as its coefficient, so the
+filter computes a sliding sum of squares
+
+```
+y[n] = sum(k = 0 .. ntaps-1) x[n + ntaps - 1 - k]^2
+```
+
+and `--coefs` is ignored. The pre-scaling variants V2 to V4 shift only the
+sample operand and keep the coefficient operand unscaled, so `pre + post =
+total` holds as before. Since `x^2 <= 1`, the worst-case gain is `L1 = ntaps`
+and `G = ceil(log2(ntaps))`. Squaring works with `--out_width 2x`, and the
+CSV `type` column gets a `-sq` suffix (`Q15-sq`, `Q15->Q31-sq`).
+
+The error model needs two changes here:
+
+* Squares are all positive and their low bits are far from uniform (odd
+  squares are 1 mod 8, and small signals concentrate near 0), so the
+  rounding errors have a signal-dependent mean that adds up coherently
+  instead of cancelling. The model therefore takes the per-tap error
+  statistics (mean and mean square of the error of `x^2 >> s`, or of
+  `(x >> s) * x`) from the actual quantised samples, assumes independent
+  taps and predicts `ntaps * msq + ntaps * (ntaps - 1) * mean^2`. This
+  applies in 1x and 2x mode.
+* Consecutive outputs are moving sums over almost the same window, so their
+  errors are strongly correlated: 1024 outputs of a 256-tap filter are only
+  about four independent realizations. Measured SNRs scatter by a few dB
+  around the model (-2.9 to +8 dB over 10 seeds, the three signals and both
+  output widths at the default length, -1.4 to +2 dB at `--len 16384`). Use a
+  larger `--len` (for example 16 * `ntaps`) for tighter numbers.
+
+For the same reason, wrap-around never helps with squaring: the partial sums
+only grow, so once they wrap the final sum does not fit either. In the sweep
+the wrapping and saturating 2x accumulators need the same minimum shift.
+
+### Rounding (`--rounding halfup|even|none`)
+
+Every right shift in the kernels (input pre-scaling, product scaling and the
+final output shift) rounds half up by default: `(v + half) >> s`. With
+`--rounding even` they use round half to even (convergent rounding) instead.
+The rounding constant becomes `half - 1 + lsb`, where `lsb` is the lowest bit
+of the truncated result, so exact ties go to the even neighbour and every
+other value rounds as before. The CSV `type` column gets an `-even` suffix.
+
+The two modes only differ on exact ties, and those only matter where many
+ties occur and add up coherently, i.e. in product scaling with a 2x output
+(V5/V6):
+
+* With random-sign products, a tie occurs with probability `s / 2^(s+1)`,
+  for example 1/8 at `s = 4`. Removing its +1/2 bias gains +10.4 dB at
+  `s = 4`, +4.8 dB at `s = 6` and +0.4 dB at the default `s = 8`. The
+  low-pass filter (`s = G = 4`) gains 10.3 dB at the default shift.
+* With `--squaring` a tie needs a residue of exactly `2^(s-1)`, but squares
+  have an even number of trailing zeros. Ties, and hence any gain, therefore
+  only occur at odd `s`: +5 to +6 dB for 256 taps, up to +20 dB for
+  4096 taps at `s = 11`. The remaining bias of squares, from their
+  non-uniform low bits, is not a tie effect, and convergent rounding does
+  not remove it.
+* With a 1x output, the product rounding error lies far below the output
+  rounding, so the two modes measure within 0.1 dB of each other.
+
+The error model accounts for this: in round half to even mode, ties add
+variance but no mean.
+
+`--rounding none` truncates instead: every shift is a plain arithmetic
+`v >> s`, i.e. floor (toward minus infinity), with no rounding constant at
+all. The CSV `type` column gets a `-trunc` suffix. Truncation costs on two
+fronts:
+
+* each truncation has a mean error of about -1/2 LSB and a mean square of
+  1/3 LSB^2 instead of 1/12, so a single output truncation alone costs
+  6 dB (V1: 67.4 -> 61.5 dB);
+* the -1/2 bias of every product truncation adds up coherently over the
+  taps. V7 truncates 256 products straight onto the output grid, which
+  leaves a 128 LSB offset and drops it from 43.2 to 14.5 dB. V10 truncates
+  each product to Qm, so even with a 1x output it falls from 67.4 to 56.3 dB.
+
+| Q15, 256 taps   | rounding | V1    | V2   | V5    | V7   | V10   |
+|-----------------|----------|-------|------|-------|------|-------|
+| 1x              | halfup   | 67.4  | 47.9 | 67.4  | 43.2 | 67.4  |
+|                 | none     | 61.5  | 45.4 | 61.4  | 14.5 | 56.3  |
+| 2x              | halfup   | 163.8 | 48.0 | 133.4 | 43.2 | 91.7  |
+|                 | none     | 157.8 | 44.6 | 104.9 | 14.5 | 62.7  |
+| squaring, 1x    | halfup   | 91.5  | 68.4 | 91.5  | 69.8 | 91.5  |
+|                 | none     | 85.6  | 67.3 | 85.6  | 38.6 | 80.5  |
+
+The model tracks this. With truncation, the product terms always use the
+exact per-tap statistics (mean -1/2 for every non-zero residue). The
+pre-scaling term adds the coherent mean `mean_e * sum(hq)`. The output term
+becomes `E[e^2] ~ 1/3`, and the means of the accumulator and output errors
+are added before squaring rather than as separate powers.
+
 A variant fails if it is more than 3 dB below its model, which is what
 `make test` and the exit status check. The status column reports
 `OVERFLOW` / `SATURATE` / `CLIPPED` instead when the accumulator wrapped, the
@@ -219,6 +357,7 @@ coefficients (L1 = 128.2, so G = 8 guard bits), matched shifts `s = G = 8`:
 | 7 | product >> (s+r) + 1x acc  | 23 | 0  | 43.2 | 43.4 | 4.693 | 15.4 |
 | 8 | product >> s + 1x acc      | 8  | 15 | 0.0 (`SATURATE`) | n/a | 680.7 | 2025 |
 | 9 | product >> r + 1x acc      | 15 | 8  | 0.2 (`SATURATE`) | n/a | 663.9 | 2028 |
+| 10 | product >> (W-1) + 2x acc, wrap | 15 | 8 | **67.4** | 67.4 | 0.290 | 0.53 |
 
 ### Q31 (32-bit samples, m = 31, total shift 39)
 
@@ -233,9 +372,10 @@ coefficients (L1 = 128.2, so G = 8 guard bits), matched shifts `s = G = 8`:
 | 7 | product >> (s+r) + 1x acc  | 39 | 0  | 139.7 | 139.7 | 4.604 | 15.9 |
 | 8 | product >> s + 1x acc      | 8  | 31 | 0.0 (`SATURATE`) | n/a | 4.5e7 | 1.3e8 |
 | 9 | product >> r + 1x acc      | 31 | 8  | 0.2 (`SATURATE`) | n/a | 4.4e7 | 1.3e8 |
+| 10 | product >> (W-1) + 2x acc, wrap | 31 | 8 | **163.6** | 163.8 | 0.294 | 0.52 |
 
-Variants 1 to 7 see no accumulator overflow or saturation at `s = G` and no
-output clipping; V2, V3 and V4 are bit exact with respect to each other, as
+Variants 1 to 7 and 10 see no accumulator overflow or saturation at `s = G`
+and no output clipping; V2, V3 and V4 are bit exact with respect to each other, as
 are V5 and V6. V8 and V9 clip, which is why no model value is shown for
 them.
 
@@ -305,7 +445,18 @@ modes (`o` = the accumulator wrapped, `s` = it saturated):
    21      2    0.0     0.0     0.0    55.3    55.3    43.2    55.3     0.0s
    22      1    0.0     0.0     0.0    49.1    49.1    43.2    49.1     0.0s
    23      0    0.0     0.0     0.0    43.2    43.2    43.2    43.2     0.0s
+   24     -1    0.0     0.0     0.0    37.2    37.2    43.2    37.2       -
+   ...
+   30     -7    0.0     0.0     0.0     2.5     2.5    43.2     2.5       -
+   31     -8    0.0     0.0     0.0     0.0     0.0    43.2     0.0       -
+   32     -9    0.0     0.0     0.0     0.0     0.0    43.2     0.0       -
 ```
+
+The sweep runs `s` from 0 to twice the input width, `2W` (32 for Q15, 64 for
+Q31), i.e. past the total shift `m + G`. Beyond that point the post shift is
+negative, an exact left shift back onto the output scale, so every bit of
+over-scaling costs 6 dB. V9 is undefined there (`-`), since its pre shift
+`m + G - s` would be negative.
 
 Several things are visible:
 
@@ -326,8 +477,8 @@ Several things are visible:
 * V8 clips until `s` is within a few bits of `m + G`, then joins V5/V6 - the
   three are equal once the products fit the sample container, since a wider
   accumulator buys nothing when the values in it are already narrow. At the
-  right edge (`s = m + G`, nothing left to shift) V5, V6, V7 and V8 all
-  converge to the same 43.2 dB.
+  point `s = m + G` (nothing left to shift) V5, V6, V7 and V8 all converge to
+  the same 43.2 dB; past it they drop by 6 dB per bit while V7 stays put.
 * V9 is the V8 column mirrored, since it shifts by `m + G - s` where V8 shifts
   by `s`. Its useful range is therefore at the *left* edge, and it shows what
   the single-wide accumulator can do at its best: leaving a few bits of the
@@ -410,9 +561,14 @@ usage: build/fir_compare [options]
   --taps N       number of FIR taps                     (default 256)
   --len N        number of output samples               (default 1024)
   --type T       q15 | q31 | both                       (default both)
+  --out_width W  1x (same as input) | 2x (Q31 for Q15)  (default 1x)
   --shift S      scaling shift for variants 2..6        (default = guard bits)
   --guard G      output guard bits                      (default ceil(log2(L1)))
   --coefs C      random | lowpass | l1norm              (default random)
+  --rounding R   halfup | even (round half to even) |   (default halfup)
+                 none (truncate)
+  --squaring     use the data samples as coefficients, y = sum x^2
+                 (--coefs is then ignored)
   --signal S     uniform | gauss | chirp                (default uniform)
   --level L      input peak level, linear 0..1          (default 1.0)
   --seed N       PRNG seed                              (default 1)
@@ -433,11 +589,16 @@ so both `make run` and `make test` are usable as regression checks.
 * V1 output is the correctly rounded exact result (peak error <= 0.5 LSB);
 * V2 == V3 == V4 and V5 == V6 bit exactly when `s = G`;
 * V8 == V7 bit exactly when `s = m + G`, and V9 == V7 when `s = 0`;
+* V10 == V5 bit exactly when `s = W - 1`;
 * every variant is within 3 dB of its error model (variants that clip or
   overflow are skipped, since the model does not describe them);
 * with `s = 0` the 2x accumulator does report wrap-around, the saturating
   version does clamp, and clamping is the less damaging of the two;
-* the impulse response reproduces the quantised coefficients.
+* the impulse response reproduces the quantised coefficients;
+* with `--rounding even`, exact ties go to the even neighbour in every
+  variant, both for a shift before and after the accumulator; with
+  `--rounding none` they go toward minus infinity, and V1 and the impulse
+  response must be within 1 LSB (truncated) instead of 1/2 LSB.
 
 ## Layout
 

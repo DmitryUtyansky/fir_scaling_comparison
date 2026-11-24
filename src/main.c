@@ -26,6 +26,26 @@
  * The default s equals G, the smallest shift that guarantees a 2W
  * accumulator cannot overflow for full-scale input.
  *
+ * With --out_width 2x the output is written to a 2W container with 2m + 1
+ * fractional bits (Q31 for Q15 input, Q63 for Q31), on the same y_exact / 2^G
+ * scale, so the total shift becomes 2m + G - (2m + 1) = G - 1.  It can be -1,
+ * and post shifts can be negative in general: those are exact left shifts.
+ * The single-wide accumulator of V7..V9 still has to hold a Qm-scaled sum, so
+ * those variants split the 1x total m + G around it exactly as in 1x mode and
+ * left-shift the remainder into the wide output.  For 2x output the errors
+ * are computed exactly against a 128-bit integer reference, since a double
+ * cannot resolve a Q63 LSB.
+ *
+ * With --squaring every tap uses the data sample it multiplies as its
+ * coefficient, y[n] = sum x[n + N-1 - k]^2.  The pre-scaling variants only
+ * shift the sample operand, so pre + post = total still holds.  Since
+ * x^2 <= 1, the worst-case gain is L1 = ntaps.
+ *
+ * --rounding selects round half up (default), round half to even or plain
+ * truncation (floor) for every right shift in the kernels.  The first two
+ * only differ on exact ties; truncation has a mean error of about -1/2 LSB
+ * at every shift, which adds up coherently over the taps.
+ *
  * The reference is a double-precision FIR fed with the *quantised* input and
  * coefficients, so the reported SNR measures the accumulation and scaling
  * error of each variant, not the input quantisation error that all of them
@@ -56,6 +76,9 @@ typedef struct {
     coef_kind_t coef;
     int do_q15;
     int do_q31;
+    int out_wide;
+    int squaring;
+    fir_rounding_t rnd;
     int sweep;
     int csv;
     int verbose;
@@ -73,13 +96,23 @@ typedef struct {
     const fir_type_ops_t *ops;
     int taps, nout, nx;
     int guard, total;
-    double l1, l2sq, sum_hq2;
+    int total1x;            /* m + G: the 1x total, also used by V7..V9 */
+    int out_wide, out_frac, out_width;
+    int squaring;
+    fir_rounding_t rnd;
+    size_t out_esize;
+    char out_name[8], label[32];
+    double l1, l2sq, sum_hq, sum_hq2;
     double ref_floor_db;
     double out_rms_dbfs, out_peak_dbfs;
     void   *xq, *hq, *scratch;
     void   *y[FIR_VARIANT_COUNT];
     double *ydbl;
     double *ref_reg;
+    double *xdq;            /* squaring only: quantised input, raw LSBs */
+    __int128 *ref_exact;    /* 2x output only: exact accumulator sums */
+    int64_t  *yint;
+    double   *err;
 } bench_t;
 
 static void *xmalloc(size_t n)
@@ -108,6 +141,15 @@ static int ceil_log2(double v)
     return (g < 0) ? 0 : g;
 }
 
+static const char *rnd_suffix(fir_rounding_t rnd)
+{
+    switch (rnd) {
+    case FIR_ROUND_HALF_EVEN: return "-even";
+    case FIR_ROUND_NONE:      return "-trunc";
+    default:                  return "";
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* Benchmark setup                                                     */
 /* ------------------------------------------------------------------ */
@@ -125,6 +167,19 @@ static void bench_init(bench_t *b, const fir_type_ops_t *ops, const opts_t *o)
     b->taps = o->taps;
     b->nout = o->len;
     b->nx   = o->len + o->taps - 1;
+    b->out_wide  = o->out_wide;
+    b->out_frac  = o->out_wide ? 2 * ops->frac + 1 : ops->frac;
+    b->out_width = o->out_wide ? 2 * ops->width : ops->width;
+    b->out_esize = o->out_wide ? ops->esize_wide : ops->esize;
+    b->squaring  = o->squaring;
+    b->rnd       = o->rnd;
+    snprintf(b->out_name, sizeof(b->out_name), "Q%d", b->out_frac);
+    if (o->out_wide)
+        snprintf(b->label, sizeof(b->label), "%s->%s%s%s", ops->name,
+                 b->out_name, o->squaring ? "-sq" : "", rnd_suffix(o->rnd));
+    else
+        snprintf(b->label, sizeof(b->label), "%s%s%s", ops->name,
+                 o->squaring ? "-sq" : "", rnd_suffix(o->rnd));
 
     xd  = xmalloc((size_t)b->nx * sizeof(double));
     hd  = xmalloc((size_t)b->taps * sizeof(double));
@@ -139,7 +194,7 @@ static void bench_init(bench_t *b, const fir_type_ops_t *ops, const opts_t *o)
     b->hq      = xmalloc((size_t)b->taps * ops->esize);
     b->scratch = xmalloc((size_t)b->nx * ops->esize);
     for (v = 0; v < FIR_VARIANT_COUNT; v++)
-        b->y[v] = xmalloc((size_t)b->nout * ops->esize);
+        b->y[v] = xmalloc((size_t)b->nout * b->out_esize);
     b->ydbl    = xmalloc((size_t)b->nout * sizeof(double));
     b->ref_reg = xmalloc((size_t)b->nout * sizeof(double));
 
@@ -155,18 +210,26 @@ static void bench_init(bench_t *b, const fir_type_ops_t *ops, const opts_t *o)
 
         b->l1      += fabs(c);
         b->l2sq    += c * c;
+        b->sum_hq  += hdq[i];
         b->sum_hq2 += hdq[i] * hdq[i];
     }
+    if (o->squaring) {
+        b->l1   = (double)b->taps;
+        b->l2sq = 0.0;
+        b->xdq  = xmalloc((size_t)b->nx * sizeof(double));
+        memcpy(b->xdq, xdq, (size_t)b->nx * sizeof(double));
+    }
 
-    b->guard = o->guard_set ? o->guard : ceil_log2(b->l1);
-    b->total = ops->frac + b->guard;
+    b->guard   = o->guard_set ? o->guard : ceil_log2(b->l1);
+    b->total1x = ops->frac + b->guard;
+    b->total   = 2 * ops->frac + b->guard - b->out_frac;
 
     /* Reference: exact sum of the integer products, scaled to the output
      * register domain.  The scaling is a power of two, hence exact. */
     ref_acc = xmalloc((size_t)b->nout * sizeof(double));
     ref_hi  = xmalloc((size_t)b->nout * sizeof(long double));
-    fir_ref_f64(xdq, hdq, b->taps, b->nout, ref_acc);
-    fir_ref_f80(xdq, hdq, b->taps, b->nout, ref_hi);
+    fir_ref_f64(xdq, o->squaring ? NULL : hdq, b->taps, b->nout, ref_acc);
+    fir_ref_f80(xdq, o->squaring ? NULL : hdq, b->taps, b->nout, ref_hi);
 
     peak = 0.0;
     for (i = 0; i < b->nout; i++) {
@@ -177,9 +240,29 @@ static void bench_init(bench_t *b, const fir_type_ops_t *ops, const opts_t *o)
     }
     b->ref_floor_db = fir_ref_floor_db(b->ref_reg, ref_hi, b->nout);
 
+    if (b->out_wide) {
+        b->ref_exact = xmalloc((size_t)b->nout * sizeof(__int128));
+        b->yint      = xmalloc((size_t)b->nout * sizeof(int64_t));
+        b->err       = xmalloc((size_t)b->nout * sizeof(double));
+        peak = 0.0;
+        for (i = 0; i < b->nout; i++) {
+            const double *xp = xdq + i + b->taps - 1;
+            __int128 acc = 0;
+            int k;
+
+            for (k = 0; k < b->taps; k++)
+                acc += (__int128)(int64_t)xp[-k] *
+                       (int64_t)(o->squaring ? xp[-k] : hdq[k]);
+            b->ref_exact[i] = acc;
+            b->ref_reg[i]   = ldexp((double)acc, -b->total);
+            if (fabs(b->ref_reg[i]) > peak)
+                peak = fabs(b->ref_reg[i]);
+        }
+    }
+
     {
         fir_metrics_t m = fir_metrics(b->ref_reg, b->ref_reg, b->nout);
-        double full = ldexp(1.0, ops->frac);
+        double full = ldexp(1.0, b->out_frac);
 
         b->out_rms_dbfs  = db20(m.rms_sig / full);
         b->out_peak_dbfs = db20(peak / full);
@@ -196,6 +279,16 @@ static void bench_free(bench_t *b)
     for (v = 0; v < FIR_VARIANT_COUNT; v++)
         free(b->y[v]);
     free(b->ydbl); free(b->ref_reg);
+    free(b->ref_exact); free(b->yint); free(b->err); free(b->xdq);
+}
+
+/* Exact error of an output sample against the accumulator sum acc, in output
+ * LSBs, for an output scale of acc / 2^t. */
+static double exact_err(int64_t y, __int128 acc, int t)
+{
+    if (t >= 0)
+        return ldexp((double)((__int128)y * ((__int128)1 << t) - acc), -t);
+    return (double)((__int128)y - acc * ((__int128)1 << -t));
 }
 
 /*
@@ -209,11 +302,110 @@ static void bench_free(bench_t *b)
  *    expressed in accumulator LSBs, sum(hq^2), before the final shift;
  *  - scaling every product by s bits injects 1/12 LSB^2 per tap, i.e.
  *    ntaps/12 at the accumulator, before the final shift.
+ *
+ * The product term ignores the bias of round-half-up, which adds up
+ * coherently over the taps.  That is harmless when the output rounding
+ * dominates, but with a 2x output the post shift is negative and the bias
+ * becomes the largest error term, so there the exact statistics from
+ * prod_round_err() are used instead.  1x keeps the plain term.
+ *
+ * With --squaring both terms use the per-tap statistics of sq_tap_err()
+ * instead, in 1x and 2x alike.
+ *
+ * Truncation has a mean error at every shift, so the model keeps track of
+ * it: the product terms always use the exact statistics, the pre-scaling
+ * term adds the coherent mean mean_e * sum(hq), the output truncation is
+ * worth E[e^2] ~ 1/3 LSB^2 rather than 1/12, and the means of the
+ * accumulator and output errors add up (the 2 * mo * ma cross term).
  */
+
+/*
+ * Mean and mean square of the truncation error of a shift by t > 0, in
+ * units of the shifted LSB, for uniformly distributed residues.
+ */
+static void trunc_err(int t, double *mean, double *msq)
+{
+    double f = 1.0 - ldexp(1.0, -t);
+
+    *mean = -0.5 * f;
+    *msq  = f * (1.0 + f) / 6.0;
+}
+
+/*
+ * Mean and mean square of the rounding error of (x * h) >> s, in units of
+ * the shifted LSB, for x and h with uniformly distributed low bits.  With
+ * k = v2(x) + v2(h) trailing zeros the product residue mod 2^s is 2^k times
+ * a uniform odd number of n = s - k bits: n = 1 is a tie (error +1/2 for
+ * round half up, +-1/2 with equal probability for round half to even),
+ * n >= 2 gives a zero-mean error with mean square 1/12 - 1/(3 * 4^n), and
+ * k >= s is exact.  P(v2(x) = i) = 2^-(i+1).  Truncation drops the residue
+ * u / 2^n instead, for every n >= 1: mean -1/2 (odd u average 2^(n-1)),
+ * mean square 1/3 - 1/(3 * 4^n).
+ */
+static void prod_round_err(int s, fir_rounding_t rnd, double *mean,
+                           double *msq)
+{
+    int i, j;
+
+    *mean = *msq = 0.0;
+    for (i = 0; i < s; i++) {
+        for (j = 0; i + j < s; j++) {
+            double p = ldexp(1.0, -(i + j + 2));
+            int n = s - i - j;
+
+            if (rnd == FIR_ROUND_NONE) {
+                *mean -= 0.5 * p;
+                *msq  += p * (1.0 / 3.0 - 1.0 / (3.0 * ldexp(1.0, 2 * n)));
+            } else if (n == 1) {
+                *mean += (rnd == FIR_ROUND_HALF_EVEN) ? 0.0 : 0.5 * p;
+                *msq  += 0.25 * p;
+            } else {
+                *msq += p * (1.0 / 12.0 - 1.0 / (3.0 * ldexp(1.0, 2 * n)));
+            }
+        }
+    }
+}
+
+/*
+ * Per-tap error statistics for --squaring, in accumulator LSBs.  Each tap's
+ * error depends only on its own sample, so they are taken from the actual
+ * quantised input rather than from a distribution: squares are all positive
+ * and their low bits are far from uniform, so the rounding bias does not
+ * cancel the way it does for random-sign coefficients and depends on the
+ * signal.  prod != 0: error of x^2 >> s, else of (x >> s) * x.
+ */
+static void sq_tap_err(const bench_t *b, int prod, int s, double *mean,
+                       double *msq)
+{
+    __int128 one = 1;
+    int i;
+
+    *mean = *msq = 0.0;
+    if (s <= 0)
+        return;
+    for (i = 0; i < b->nx; i++) {
+        __int128 x = (__int128)(int64_t)b->xdq[i];
+        __int128 v = prod ? x * x : x;
+        __int128 c = (b->rnd == FIR_ROUND_NONE) ? 0 :
+                     (one << (s - 1)) - ((b->rnd == FIR_ROUND_HALF_EVEN) ?
+                                         1 - ((v >> s) & 1) : 0);
+        __int128 r = ((v + c) >> s) * (one << s) - v;
+        double d = ldexp((double)(prod ? r : r * x), -s);
+
+        *mean += d;
+        *msq  += d * d;
+    }
+    *mean /= (double)b->nx;
+    *msq  /= (double)b->nx;
+}
+
 static double predict_snr_db(const bench_t *b, fir_variant_t v, int shift,
                              int out_shift)
 {
-    double sig = 0.0, noise, gain;
+    double sig = 0.0, noise, gain, mean, msq;
+    double mo = 0.0, ma = 0.0;   /* truncation: mean output / acc error */
+    double scale = ldexp(1.0, -out_shift);
+    int trunc = (b->rnd == FIR_ROUND_NONE);
     int i;
 
     for (i = 0; i < b->nout; i++)
@@ -222,6 +414,8 @@ static double predict_snr_db(const bench_t *b, fir_variant_t v, int shift,
 
     /* The output rounding only costs something if there is a shift left. */
     noise = (out_shift > 0) ? 1.0 / 12.0 : 0.0;
+    if (trunc && out_shift > 0)
+        trunc_err(out_shift, &mo, &noise);
 
     gain = ldexp(1.0, -2 * out_shift);
     if (shift > 0) {
@@ -229,19 +423,44 @@ static double predict_snr_db(const bench_t *b, fir_variant_t v, int shift,
         case FIR_V2_PRE_ACC4X:
         case FIR_V3_PRE_ACC2X_WRAP:
         case FIR_V4_PRE_ACC2X_SAT:
-            noise += (1.0 / 12.0) * b->sum_hq2 * gain;
+            if (b->squaring) {
+                sq_tap_err(b, 0, shift, &mean, &msq);
+                noise += ((double)b->taps * msq +
+                          (double)b->taps * (b->taps - 1) * mean * mean) * gain;
+                ma = (double)b->taps * mean * scale;
+            } else if (trunc) {
+                trunc_err(shift, &mean, &msq);
+                noise += ((msq - mean * mean) * b->sum_hq2 +
+                          mean * mean * b->sum_hq * b->sum_hq) * gain;
+                ma = mean * b->sum_hq * scale;
+            } else {
+                noise += (1.0 / 12.0) * b->sum_hq2 * gain;
+            }
             break;
         case FIR_V5_POST_ACC2X_WRAP:
         case FIR_V6_POST_ACC2X_SAT:
         case FIR_V7_FULL_ACC1X_SAT:
         case FIR_V8_POST_ACC1X_SAT:
         case FIR_V9_PRE_ACC1X_SAT:
-            noise += (1.0 / 12.0) * (double)b->taps * gain;
+        case FIR_V10_PRODM_ACC2X_WRAP:
+            if (b->squaring || b->out_wide || trunc) {
+                if (b->squaring)
+                    sq_tap_err(b, 1, shift, &mean, &msq);
+                else
+                    prod_round_err(shift, b->rnd, &mean, &msq);
+                noise += ((double)b->taps * msq +
+                          (double)b->taps * (b->taps - 1) * mean * mean) * gain;
+                ma = (double)b->taps * mean * scale;
+            } else {
+                noise += (1.0 / 12.0) * (double)b->taps * gain;
+            }
             break;
         default:
             break;
         }
     }
+    if (trunc)
+        noise += 2.0 * mo * ma;
     return (noise > 0.0) ? 10.0 * log10(sig / noise) : INFINITY;
 }
 
@@ -250,19 +469,32 @@ static void bench_run(bench_t *b, fir_variant_t v, int shift, result_t *r)
     int use_shift = fir_variant_uses_shift(v) ? shift : 0;
 
     /* V7 puts the whole shift in front of the accumulator, V9 uses the
-     * complement of the swept shift; both keep pre + post = total. */
+     * complement of the swept shift and V10 a fixed W - 1 = m; all keep
+     * pre + post = total. */
     if (v == FIR_V7_FULL_ACC1X_SAT)
-        use_shift = b->total;
+        use_shift = b->total1x;
     else if (v == FIR_V9_PRE_ACC1X_SAT)
-        use_shift = b->total - use_shift;
+        use_shift = b->total1x - use_shift;
+    else if (v == FIR_V10_PRODM_ACC2X_WRAP)
+        use_shift = b->ops->frac;
 
     r->shift     = use_shift;
     r->out_shift = b->total - use_shift;
 
-    b->ops->run(v, b->xq, b->scratch, b->y[v], b->nout, b->hq, b->taps,
-                use_shift, r->out_shift, &r->st);
-    b->ops->to_double(b->y[v], b->ydbl, b->nout);
-    r->m       = fir_metrics(b->ref_reg, b->ydbl, b->nout);
+    b->ops->run(v, b->xq, b->scratch, b->y[v], b->nout,
+                b->squaring ? NULL : b->hq, b->taps, use_shift, r->out_shift,
+                b->out_wide, b->rnd, &r->st);
+    if (b->out_wide) {
+        int i;
+
+        b->ops->wide_to_i64(b->y[v], b->yint, b->nout);
+        for (i = 0; i < b->nout; i++)
+            b->err[i] = exact_err(b->yint[i], b->ref_exact[i], b->total);
+        r->m = fir_metrics_err(b->ref_reg, b->err, b->nout);
+    } else {
+        b->ops->to_double(b->y[v], b->ydbl, b->nout);
+        r->m = fir_metrics(b->ref_reg, b->ydbl, b->nout);
+    }
     r->pred_db = predict_snr_db(b, v, use_shift, r->out_shift);
 }
 
@@ -293,34 +525,71 @@ static const char *status_of(const result_t *r)
 
 static int report(bench_t *b, const opts_t *o, result_t *res)
 {
-    int v, fails = 0;
+    int v, fails = 0, w = 0;
+
+    for (v = 0; v < FIR_VARIANT_COUNT; v++) {
+        int len = (int)strlen(fir_variant_name((fir_variant_t)v));
+
+        if (len > w)
+            w = len;
+    }
 
     printf("\n");
     printf("================================================================"
            "================\n");
-    printf("Fixed-point FIR scaling comparison - %s\n", b->ops->name);
+    if (b->out_wide)
+        printf("Fixed-point FIR scaling comparison - %s in, %s out\n",
+               b->ops->name, b->out_name);
+    else
+        printf("Fixed-point FIR scaling comparison - %s\n", b->ops->name);
     printf("================================================================"
            "================\n");
     printf("  format             : %s (%d-bit container, %d fractional bits)\n",
            b->ops->name, b->ops->width, b->ops->frac);
+    if (b->out_wide)
+        printf("  output format      : %s (%d-bit container, %d fractional "
+               "bits, 2x wide)\n", b->out_name, b->out_width, b->out_frac);
     printf("  output samples     : %d  (input buffer %d = %d + %d history)\n",
            b->nout, b->nx, b->nout, b->taps - 1);
     printf("  taps               : %d\n", b->taps);
     printf("  input signal       : %s, %.1f dBFS peak level\n",
            sig_kind_name(o->sig), db20(o->level));
-    printf("  coefficients       : %s\n", coef_kind_name(o->coef));
-    printf("  filter gain        : L1 = %.4f (%.2f dB), L2 = %.4f (%.2f dB)\n",
-           b->l1, db20(b->l1), sqrt(b->l2sq), db20(sqrt(b->l2sq)));
-    printf("  guard bits G       : %d%s  -> total right shift m+G = %d\n",
-           b->guard, o->guard_set ? " (forced)" : " (= ceil(log2(L1)))",
-           b->total);
+    if (b->squaring) {
+        printf("  coefficients       : squaring, every tap uses its own data "
+               "sample: y = sum x^2\n");
+        printf("  filter gain        : worst case L1 = ntaps = %.0f (%.2f dB), "
+               "since x^2 <= 1\n", b->l1, db20(b->l1));
+    } else {
+        printf("  coefficients       : %s\n", coef_kind_name(o->coef));
+        printf("  filter gain        : L1 = %.4f (%.2f dB), L2 = %.4f "
+               "(%.2f dB)\n", b->l1, db20(b->l1), sqrt(b->l2sq),
+               db20(sqrt(b->l2sq)));
+    }
+    if (b->out_wide)
+        printf("  guard bits G       : %d%s  -> total right shift "
+               "2m+G-(2m+1) = G-1 = %d\n", b->guard,
+               o->guard_set ? " (forced)" : " (= ceil(log2(L1)))", b->total);
+    else
+        printf("  guard bits G       : %d%s  -> total right shift m+G = %d\n",
+               b->guard, o->guard_set ? " (forced)" : " (= ceil(log2(L1)))",
+               b->total);
     printf("  scaling shift s    : %d%s  (V7 always uses the full m+G, "
-           "V9 the complement m+G-s)\n", res[FIR_V2_PRE_ACC4X].shift,
-           o->shift_set ? " (forced)" : " (= G, matched downscaling)");
+           "V9 the complement m+G-s, V10 a fixed W-1 = %d)\n",
+           res[FIR_V2_PRE_ACC4X].shift,
+           o->shift_set ? " (forced)" : " (= G, matched downscaling)",
+           b->ops->frac);
+    if (b->rnd == FIR_ROUND_HALF_EVEN)
+        printf("  rounding           : round half to even (convergent), all "
+               "shifts\n");
+    else if (b->rnd == FIR_ROUND_NONE)
+        printf("  rounding           : none, all shifts truncate (floor)\n");
     printf("  reference output   : %.2f dBFS rms, %.2f dBFS peak"
            " (%.1f dB of the range is worst-case headroom)\n",
            b->out_rms_dbfs, b->out_peak_dbfs, -b->out_peak_dbfs);
-    if (b->ref_floor_db == INFINITY)
+    if (b->out_wide)
+        printf("  reference          : exact (128-bit integer sums, errors "
+               "computed exactly)\n");
+    else if (b->ref_floor_db == INFINITY)
         printf("  double ref. floor  : exact (all products fit the 53-bit "
                "mantissa)\n");
     else
@@ -328,10 +597,9 @@ static int report(bench_t *b, const opts_t *o, result_t *res)
                b->ref_floor_db);
     printf("----------------------------------------------------------------"
            "----------------\n");
-    printf(" #  variant               pre   post     SNR    model   rms err"
-           "  max err    ovf    sat  status\n");
-    printf("                                        [dB]     [dB]     [LSB]"
-           "    [LSB]\n");
+    printf(" #  %-*s  pre   post     SNR    model   rms err"
+           "  max err    ovf    sat  status\n", w, "variant");
+    printf("%*s[dB]     [dB]     [LSB]    [LSB]\n", w + 20, "");
     printf("----------------------------------------------------------------"
            "----------------\n");
 
@@ -347,8 +615,8 @@ static int report(bench_t *b, const opts_t *o, result_t *res)
             fmt_db(pred, sizeof(pred), r->pred_db);
         snprintf(sh, sizeof(sh), "%d", r->shift);
 
-        printf(" %d  %-20s %3s %6d %7s %8s %9.4g %8.4g %6llu %6llu  %s\n",
-               v + 1, fir_variant_name((fir_variant_t)v), sh, r->out_shift,
+        printf("%2d  %-*s %3s %6d %7s %8s %9.4g %8.4g %6llu %6llu  %s\n",
+               v + 1, w, fir_variant_name((fir_variant_t)v), sh, r->out_shift,
                snr, pred, r->m.rms_err, r->m.max_err,
                (unsigned long long)r->st.acc_ovf,
                (unsigned long long)r->st.acc_sat, st);
@@ -359,9 +627,17 @@ static int report(bench_t *b, const opts_t *o, result_t *res)
     printf("----------------------------------------------------------------"
            "----------------\n");
     for (v = 0; v < FIR_VARIANT_COUNT; v++)
-        printf("  %d: %s\n", v + 1, fir_variant_desc((fir_variant_t)v));
-    printf("  pre / post: right shift applied before / after the "
-           "accumulator; pre + post = m + G = %d\n", b->total);
+        printf(" %2d: %s\n", v + 1, fir_variant_desc((fir_variant_t)v));
+    if (b->out_wide)
+        printf("  pre / post: right shift applied before / after the "
+               "accumulator; pre + post = G - 1 = %d,\n"
+               "  a negative post is an exact left shift into the 2x output. "
+               "V7..V9 split the 1x\n"
+               "  total m + G = %d around their single-wide accumulator as in "
+               "1x mode.\n", b->total, b->total1x);
+    else
+        printf("  pre / post: right shift applied before / after the "
+               "accumulator; pre + post = m + G = %d\n", b->total);
     printf("  status: ok = within %.0f dB of the error model; OVERFLOW / "
            "SATURATE / CLIPPED mean\n"
            "  the scaling is under-dimensioned, which the model does not "
@@ -388,7 +664,7 @@ static void report_csv(const bench_t *b, result_t *res, int header)
         const result_t *r = &res[v];
 
         printf("%s,%d,%d,%d,%d,%s,%d,%d,%.3f,%.3f,%.6f,%.3f,%llu,%llu,%llu\n",
-               b->ops->name, b->taps, b->nout, b->guard, v + 1,
+               b->label, b->taps, b->nout, b->guard, v + 1,
                fir_variant_name((fir_variant_t)v), r->shift, r->out_shift,
                r->m.snr_db, r->pred_db, r->m.rms_err, r->m.max_err,
                (unsigned long long)r->st.acc_ovf,
@@ -401,24 +677,28 @@ static void report_csv(const bench_t *b, result_t *res, int header)
 static void report_sweep(bench_t *b)
 {
     int s, v;
-    int smax = b->total < 24 ? b->total : 24;
+    int smax = 2 * b->ops->width;
 
     printf("\n  scaling shift sweep, SNR in dB "
            "('o' = accumulator wrapped, 's' = accumulator saturated)\n");
     printf("  ------------------------------------------------------------"
            "----\n");
     printf("    s  outsh");
-    for (v = 1; v < FIR_VARIANT_COUNT; v++)
+    for (v = 1; v <= FIR_V9_PRE_ACC1X_SAT; v++)
         printf("      V%d", v + 1);
     printf("\n");
 
     for (s = 0; s <= smax; s++) {
         printf("  %3d %6d", s, b->total - s);
-        for (v = 1; v < FIR_VARIANT_COUNT; v++) {
+        for (v = 1; v <= FIR_V9_PRE_ACC1X_SAT; v++) {
             result_t r;
             char snr[16];
             char flag = ' ';
 
+            if (v == FIR_V9_PRE_ACC1X_SAT && s > b->total1x) {
+                printf(" %6s ", "-");
+                continue;
+            }
             bench_run(b, (fir_variant_t)v, s, &r);
             fmt_db(snr, sizeof(snr), r.m.snr_db);
             if (r.st.acc_ovf)
@@ -435,8 +715,11 @@ static void report_sweep(bench_t *b)
            "        are harmless as long as the final sum fits - unlike\n"
            "        saturation, which destroys the result irreversibly.\n"
            "  note: V7 always shifts by m+G before the accumulator and V9 by\n"
-           "        m+G-s, so the V9 column is the V8 column mirrored.\n",
-           2 * b->ops->width);
+           "        m+G-s, so the V9 column is the V8 column mirrored; V9 is\n"
+           "        undefined ('-') for s > m+G = %d.\n"
+           "  note: s runs up to 2W = %d; post shifts below 0 are exact\n"
+           "        left shifts.\n",
+           2 * b->ops->width, b->total1x, smax);
 }
 
 /* ------------------------------------------------------------------ */
@@ -449,6 +732,48 @@ static int expect(int cond, const char *what)
     return cond ? 0 : 1;
 }
 
+/*
+ * Exact ties: a one-tap filter with h = 1 LSB and odd inputs makes every
+ * result x / 2 a tie, for every variant and for both a shift before
+ * (pre = 1) and after (post = 1) the accumulator.  Round half to even must
+ * send them to the even neighbour, truncation to minus infinity.
+ */
+static int tie_test(const fir_type_ops_t *ops, fir_rounding_t rnd)
+{
+    static const double k[] = { 1, 3, 5, 7, -1, -3, -5, -7 };
+    static const double even[] = { 0, 2, 2, 4, 0, -2, -2, -4 };
+    static const double floor_[] = { 0, 1, 2, 3, -1, -2, -3, -4 };
+    const double *want = (rnd == FIR_ROUND_NONE) ? floor_ : even;
+    enum { N = sizeof(k) / sizeof(k[0]) };
+    double xd[N], hd = ldexp(1.0, -ops->frac), yd[N];
+    void *xq = xmalloc(N * ops->esize), *hq = xmalloc(ops->esize);
+    void *sc = xmalloc(N * ops->esize), *y = xmalloc(N * ops->esize);
+    fir_stats_t st;
+    int i, v, pre, bad = 0;
+
+    for (i = 0; i < N; i++)
+        xd[i] = ldexp(k[i], -ops->frac);
+    ops->quantize(xd, xq, N);
+    ops->quantize(&hd, hq, 1);
+    for (v = 0; v < FIR_VARIANT_COUNT; v++) {
+        for (pre = 0; pre <= 1; pre++) {
+            if (pre && !fir_variant_uses_shift((fir_variant_t)v))
+                continue;
+            ops->run((fir_variant_t)v, xq, sc, y, N, hq, 1, pre, 1 - pre, 0,
+                     rnd, &st);
+            ops->to_double(y, yd, N);
+            for (i = 0; i < N; i++)
+                bad += (yd[i] != want[i]);
+        }
+    }
+    free(xq); free(hq); free(sc); free(y);
+    return expect(bad == 0, (rnd == FIR_ROUND_NONE) ?
+                  "truncation rounds exact ties toward minus infinity (all "
+                  "variants, pre and post)" :
+                  "round half to even sends exact ties to the even "
+                  "neighbour (all variants, pre and post)");
+}
+
 static int selftest(const fir_type_ops_t *ops, const opts_t *base)
 {
     opts_t o = *base;
@@ -457,15 +782,19 @@ static int selftest(const fir_type_ops_t *ops, const opts_t *base)
     int v, fails = 0;
     size_t ybytes;
 
-    printf("\nself test - %s\n", ops->name);
     bench_init(&b, ops, &o);
-    ybytes = (size_t)b.nout * ops->esize;
+    printf("\nself test - %s\n", b.label);
+    ybytes = (size_t)b.nout * b.out_esize;
 
     for (v = 0; v < FIR_VARIANT_COUNT; v++)
         bench_run(&b, (fir_variant_t)v, o.shift_set ? o.shift : b.guard, &r[v]);
 
-    fails += expect(r[FIR_V1_ACC4X].m.max_err <= 0.5 + 1e-9,
-                    "V1 output is the correctly rounded exact result");
+    if (b.rnd == FIR_ROUND_NONE)
+        fails += expect(r[FIR_V1_ACC4X].m.max_err < 1.0,
+                        "V1 output is the truncated exact result");
+    else
+        fails += expect(r[FIR_V1_ACC4X].m.max_err <= 0.5 + 1e-9,
+                        "V1 output is the correctly rounded exact result");
     fails += expect(r[FIR_V1_ACC4X].st.acc_ovf == 0 &&
                     r[FIR_V1_ACC4X].st.acc_sat == 0,
                     "V1 never overflows the 4x accumulator");
@@ -498,11 +827,16 @@ static int selftest(const fir_type_ops_t *ops, const opts_t *base)
     {
         result_t rr;
 
-        bench_run(&b, FIR_V7_FULL_ACC1X_SAT, b.total, &rr);
-        bench_run(&b, FIR_V8_POST_ACC1X_SAT, b.total, &rr);
+        bench_run(&b, FIR_V7_FULL_ACC1X_SAT, b.total1x, &rr);
+        bench_run(&b, FIR_V8_POST_ACC1X_SAT, b.total1x, &rr);
         fails += expect(memcmp(b.y[FIR_V7_FULL_ACC1X_SAT],
                                b.y[FIR_V8_POST_ACC1X_SAT], ybytes) == 0,
                         "V8 == V7 bit exact when s = m + G");
+        bench_run(&b, FIR_V5_POST_ACC2X_WRAP, ops->frac, &rr);
+        bench_run(&b, FIR_V10_PRODM_ACC2X_WRAP, 0, &rr);
+        fails += expect(memcmp(b.y[FIR_V5_POST_ACC2X_WRAP],
+                               b.y[FIR_V10_PRODM_ACC2X_WRAP], ybytes) == 0,
+                        "V10 == V5 bit exact when s = W - 1");
         bench_run(&b, FIR_V9_PRE_ACC1X_SAT, 0, &rr);
         fails += expect(memcmp(b.y[FIR_V7_FULL_ACC1X_SAT],
                                b.y[FIR_V9_PRE_ACC1X_SAT], ybytes) == 0,
@@ -538,20 +872,33 @@ static int selftest(const fir_type_ops_t *ops, const opts_t *base)
         xd[b.taps - 1] = ldexp(1.0, -1);              /* 0.5 full scale */
         ops->quantize(xd, b.xq, b.nx);
         ops->to_double(b.hq, hdq, b.taps);
-        ops->run(FIR_V1_ACC4X, b.xq, b.scratch, b.y[0], b.nout, b.hq, b.taps,
-                 0, b.total, &st);
-        ops->to_double(b.y[0], yd, b.nout);
+        ops->run(FIR_V1_ACC4X, b.xq, b.scratch, b.y[0], b.nout,
+                 b.squaring ? NULL : b.hq, b.taps, 0, b.total, b.out_wide,
+                 b.rnd, &st);
+        if (b.out_wide) {
+            ops->wide_to_i64(b.y[0], b.yint, b.nout);
+            for (i = 0; i < b.nout; i++)
+                yd[i] = (double)b.yint[i];
+        } else {
+            ops->to_double(b.y[0], yd, b.nout);
+        }
         for (i = 0; i < b.taps && i < b.nout; i++) {
-            double want = ldexp(hdq[i] * ldexp(1.0, ops->frac - 1), -b.total);
+            double c = b.squaring ? ldexp(1.0, ops->frac - 1) : hdq[i];
+            double want = ldexp(c * ldexp(1.0, ops->frac - 1), -b.total);
             double e = fabs(yd[i] - want);
 
             if (e > worst)
                 worst = e;
         }
-        fails += expect(worst <= 0.5 + 1e-9,
+        fails += expect(b.rnd == FIR_ROUND_NONE ? worst < 1.0 :
+                        worst <= 0.5 + 1e-9, b.squaring ?
+                        "squared impulse gives a box of ntaps samples" :
                         "impulse response reproduces the coefficients");
         free(xd); free(yd); free(hdq);
     }
+
+    if (b.rnd != FIR_ROUND_HALF_UP)
+        fails += tie_test(ops, b.rnd);
 
     bench_free(&b);
     return fails;
@@ -569,9 +916,14 @@ static void usage(const char *prog)
 "  --taps N       number of FIR taps                     (default 256)\n"
 "  --len N        number of output samples               (default 1024)\n"
 "  --type T       q15 | q31 | both                       (default both)\n"
+"  --out_width W  1x (same as input) | 2x (Q31 for Q15)  (default 1x)\n"
 "  --shift S      scaling shift for variants 2..6        (default = guard bits)\n"
 "  --guard G      output guard bits                      (default ceil(log2(L1)))\n"
 "  --coefs C      random | lowpass | l1norm              (default random)\n"
+"  --rounding R   halfup | even (round half to even) |   (default halfup)\n"
+"                 none (truncate)\n"
+"  --squaring     use the data samples as coefficients, y = sum x^2\n"
+"                 (--coefs is then ignored)\n"
 "  --signal S     uniform | gauss | chirp                (default uniform)\n"
 "  --level L      input peak level, linear 0..1          (default 1.0)\n"
 "  --seed N       PRNG seed                              (default 1)\n"
@@ -623,6 +975,28 @@ int main(int argc, char **argv)
                 fprintf(stderr, "fir_compare: unknown type '%s'\n", argv[i]);
                 return 2;
             }
+        } else if (!strcmp(a, "--out_width")) {
+            need_arg(++i, argc, a);
+            if (!strcmp(argv[i], "1x"))
+                o.out_wide = 0;
+            else if (!strcmp(argv[i], "2x"))
+                o.out_wide = 1;
+            else {
+                fprintf(stderr, "fir_compare: unknown output width '%s'\n", argv[i]);
+                return 2;
+            }
+        } else if (!strcmp(a, "--rounding")) {
+            need_arg(++i, argc, a);
+            if (!strcmp(argv[i], "halfup"))
+                o.rnd = FIR_ROUND_HALF_UP;
+            else if (!strcmp(argv[i], "even"))
+                o.rnd = FIR_ROUND_HALF_EVEN;
+            else if (!strcmp(argv[i], "none"))
+                o.rnd = FIR_ROUND_NONE;
+            else {
+                fprintf(stderr, "fir_compare: unknown rounding '%s'\n", argv[i]);
+                return 2;
+            }
         } else if (!strcmp(a, "--coefs")) {
             need_arg(++i, argc, a);
             if (coef_kind_parse(argv[i], &o.coef)) {
@@ -637,6 +1011,7 @@ int main(int argc, char **argv)
             }
         }
         else if (!strcmp(a, "--sweep"))    o.sweep = 1;
+        else if (!strcmp(a, "--squaring")) o.squaring = 1;
         else if (!strcmp(a, "--csv"))      o.csv = 1;
         else if (!strcmp(a, "--verbose"))  o.verbose = 1;
         else if (!strcmp(a, "--selftest")) do_selftest = 1;
@@ -678,9 +1053,9 @@ int main(int argc, char **argv)
 
         bench_init(&b, ops, &o);
         shift = o.shift_set ? o.shift : b.guard;
-        if (shift < 0 || shift > b.total) {
+        if (shift < 0 || shift > b.total1x) {
             fprintf(stderr, "fir_compare: --shift must be in [0, %d] for %s\n",
-                    b.total, ops->name);
+                    b.total1x, ops->name);
             bench_free(&b);
             return 2;
         }
